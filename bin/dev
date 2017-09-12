@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+
+[ ! -z "$DEBUG" ] && set -x
+
+if [[ "$OSTYPE" == darwin* ]]; then
+  OSX="yes"
+  boot2docker_shellinit=$(boot2docker shellinit 2>/dev/null)
+  if [ $? = 0 ]; then
+    eval $boot2docker_shellinit
+  fi
+fi
+
+# Find the real, absolute, canonicalized filename.
+# OSX doesn't have `readlink -f`.
+# @see http://stackoverflow.com/q/1055671
+readlinkf() {
+  echo $(
+    readlink -f "$1" 2>/dev/null ||\
+    greadlink -f "$1" 2>/dev/null ||\
+    perl -MCwd -e 'print Cwd::abs_path shift' "$1"
+  )
+}
+
+DIR=$(dirname "$(readlinkf "$0")")
+
+port_arguments() {
+  local ports=""
+  for port in "$@"; do
+    ports+="--publish $port "
+  done
+  echo $ports
+}
+
+image_tag() {
+  local name=$(echo $1 | tr '[:lower:]' '[:upper:]')
+  local tag_var=${name}_VER
+  local tag=${!tag_var}
+  echo ${tag:-latest}
+}
+
+pull_image() {
+  regexp="$(echo $1 | sed -e 's/:/\\s*/')" # /gewo/mongodb\s*latest/
+  if ! docker images | grep "$regexp" >/dev/null; then
+    docker pull $1
+  fi
+}
+
+run_image() {
+  local name=$1
+  local ports=$(port_arguments "${@:2}")
+  local image="gewo/$name"
+  local tag=$(image_tag $name)
+  pull_image ${image}:${tag}
+  local id=$(docker run \
+    --detach \
+    --volumes-from ${USER}_${name}_data \
+    --name ${USER}_$name \
+    $ports \
+    ${image}:${tag})
+  echo "Started $name in container $id"
+}
+
+create_data_container() {
+  local name=$1
+  docker ps -a | grep "${USER}_${name}_data" > /dev/null
+  if [ $? != 0 ]; then
+    docker run --volume /data --volume /logs --name ${USER}_${name}_data busybox true
+  fi
+}
+
+start_image() {
+  local name=$1
+  create_data_container $name
+  run_image $@
+}
+
+link_arguments() {
+  local links=""
+  for service in redis mongodb mysql; do
+    links+="--link ${USER}_$service:$service "
+  done
+  echo $links
+}
+
+# https://gist.github.com/d11wtq/8699521
+ssh_agent_forwarding() {
+  if [ -n "$SSH_AUTH_SOCK" ]; then
+    local sock_dir=$(dirname $SSH_AUTH_SOCK)
+    echo "--volume $sock_dir:$sock_dir --env SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+  fi
+}
+
+dotfiles() {
+  local dotfiles="${DOTFILES:-.zsh .zshrc .bash_history .bashrc .gitconfig .rspec .pry_history}"
+  local mount_args=""
+  if [ -n "$SYNC_DOTFILES" ]; then
+    for file in $dotfiles; do
+      [ -r "$HOME/$file" ] && mount_args+="--volume $HOME/$file:/$file "
+    done
+    echo $mount_args
+  fi
+}
+
+guess_ruby_version() {
+  local ruby_version=$RUBY_VER
+  [ -z "$ruby_version" ] && \
+    ruby_version=$(grep '^ruby[\t ]' Gemfile 2>/dev/null | awk '{ print $2 }' | xargs)
+  ruby_version=${ruby_version:-latest}
+  echo $ruby_version
+}
+
+ruby_image() {
+  echo "gewo/ruby:$(guess_ruby_version)"
+}
+
+shell_image() {
+  local image=$IMAGE
+  if [ -z "$image" ]; then
+    image=$(ruby_image)
+  fi
+  echo $image
+}
+
+start_services() {
+  start_image redis 6379
+  start_image mongodb 27017 28017
+  start_image mysql 3306
+}
+
+common_run_args() {
+  [ -n "$PORT" ] && local port="${PORT}:"
+  [ -n "$SYNC_DOTFILES" ] && [[ "$SHELL" =~ zsh ]] && local shell="zsh"
+  if [ -n "$*" ]; then
+    local cmd="$@"
+  else
+    local cmd=${shell:-bash}
+  fi
+
+  echo \
+    --interactive \
+    --tty \
+    --volume "$PWD":/mnt \
+    --publish ${port}3000 \
+    --name "${USER}_shell_$(date +%s)${RANDOM}" \
+    $(dotfiles) \
+    $(ssh_agent_forwarding) \
+    $(link_arguments) \
+    $EXTRA_ARGS \
+    $(shell_image) \
+    $cmd
+}
+
+setup_osx() {
+  if [ -n "$OSX" ]; then
+    status=$(boot2docker status 2>/dev/null)
+    if [ $? != 0 ]; then
+      boot2docker init
+    fi
+    if [ "$status" != "running" ]; then
+      boot2docker start
+    fi
+    eval $(boot2docker shellinit 2>/dev/null)
+  fi
+}
+
+cmd_start() {
+  setup_osx
+  start_services
+}
+
+cmd_stop() {
+  local running=$(docker ps | tail -n +2 | grep ${USER}_ | awk '{ print $1 }')
+  if [ "$running" != "" ]; then
+    docker stop $running
+    docker rm $running
+  fi
+}
+
+cmd_kill() {
+  local containers=$(docker ps -a | tail -n +2 | grep -v "_data" | \
+    grep ${USER} | awk '{ print $1 }')
+  if [ "$containers" != "" ]; then
+    docker stop $containers
+    docker rm $containers
+  fi
+}
+
+cmd_shell() {
+  [ -n "$1" ] && IMAGE=$1
+  pull_image $(shell_image)
+  local id=$(docker run --detach $(common_run_args))
+  echo "port 3000 forwarded to $(docker port $id 3000)"
+  docker attach $id
+  sleep 1 && docker rm $id >/dev/null
+}
+
+cmd_run() {
+  docker run --rm $(common_run_args "$*")
+}
+
+cmd_build_images() {
+  $DIR/build_images "${@}"
+}
+
+cmd_update() {
+  cd $DIR/.. && git pull
+  images=(base redis mysql mongodb node php ruby)
+  for image in ${images[@]}; do
+    docker pull gewo/$image
+  done
+}
+
+cmd_docker() {
+  docker "${@}"
+}
+
+cmd_boot2docker() {
+  boot2docker "${@}"
+}
+
+cmd_help() {
+  cat <<EOF
+Usage: $(basename $0) [start,stop,kill,shell,run,build_images,docker,boot2docker,help]
+Please visit http://github.com/gewo/living-in-a-box/ for help.
+EOF
+  exit 1
+}
+
+fn_exists() {
+  declare -f $1 > /dev/null
+  return $?
+}
+
+if [ "$BASH_SOURCE" = "$0" ]; then
+  cmd="$1"
+  shift
+
+  if fn_exists cmd_$cmd; then
+    cmd_$cmd "$@"
+  else
+    cmd_help
+  fi
+fi
